@@ -11,3 +11,4 @@ node_modules/
 *.jpg
 *.jpeg
 .~lock.output.docx#
+.docs#
