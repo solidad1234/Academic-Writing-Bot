@@ -183,13 +183,14 @@ DOCUMENT:
     if has_mixed:
         print(f"   ⚠️  Embedded instructions found: {summary}")
         if not essay:
-            print("   ℹ️  No essay body found — only instructions detected.")
-            print("      The bot will treat the whole document as context and wait for content.")
-            essay = ""
+            print("   ℹ️  No essay body found — topic/instructions only.")
+            print("      Will write the essay from scratch.")
+            # Store the raw text so run_pipeline can use it as the topic prompt
+            extracted["_raw_instructions"] = raw
         else:
             print(f"   📄 Essay content isolated: {len(essay.split())} words.")
-        if extracted:
-            nice = ", ".join(f"{k}={repr(v)}" for k, v in extracted.items())
+        if {k: v for k, v in extracted.items() if not k.startswith("_")}:
+            nice = ", ".join(f"{k}={repr(v)}" for k, v in extracted.items() if not k.startswith("_"))
             print(f"   ⚙️  Settings extracted from file: {nice}")
     else:
         print("   ✅ No embedded instructions — treating entire input as essay text.")
@@ -206,7 +207,8 @@ INSTRUCTION_DEFAULTS = {
     "style":       "apa",
     "pages":       None,
     "sources":     None,
-    "humanize":    False,
+    "humanize":    True,
+    "min_year":    None,   # None = auto (current_year - 5)
     "title":       "Academic Paper",
     "author":      "Author Name",
     "institution": "Institution Name",
@@ -292,9 +294,13 @@ def print_settings(s: dict):
     print(f"\n{'─'*55}")
     print(f"  Settings")
     print(f"{'─'*55}")
+    from datetime import datetime
+    auto_year = datetime.now().year - 5
+    year_display = s.get("min_year") or f"{auto_year} (auto)"
     print(f"  Style       : {s['style'].upper()}")
     print(f"  Pages       : {s['pages'] or 'no target'}")
     print(f"  Sources     : {s['sources'] or 'as many as needed'}")
+    print(f"  Sources from: {year_display}+")
     print(f"  Humanize    : {'yes' if s['humanize'] else 'no'}")
     print(f"  Title       : {s['title']}")
     print(f"  Author      : {s['author']}")
@@ -306,40 +312,115 @@ def print_settings(s: dict):
 
 
 # ══════════════════════════════════════════════
-# SECTION 3 — TEXT EXPANSION (page target)
+# SECTION 3 — ESSAY WRITING
 # ══════════════════════════════════════════════
 
-def expand_text_to_pages(text: str, pages: int, style: str, client: anthropic.Anthropic) -> str:
-    """If a page target is set and the text is shorter, ask Claude to expand it."""
-    target_words  = pages * WORDS_PER_PAGE
-    current_words = len(text.split())
-    if current_words >= target_words * 0.9:
-        return text
+def write_essay_from_scratch(topic: str, pages: int, sources: int, style: str,
+                              client: anthropic.Anthropic) -> str:
+    """Write a complete essay from a topic/instructions string.
 
-    print(f"\n📝 Expanding text to ~{target_words} words ({pages} pages)...")
+    Crucially: every factual claim is written as a BARE STATEMENT with no citation
+    marker at all. Citations are inserted later by the citation pipeline after real
+    sources have been found. This eliminates placeholder citations entirely.
+    """
+    target_words = (pages or 3) * WORDS_PER_PAGE
+    num_sources  = sources or 6
+    print(f"\n✏️  Writing essay from scratch (~{target_words} words, {num_sources} sources needed)...")
+
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=8000,
         messages=[{
             "role": "user",
-            "content": f"""You are an academic writer. Expand the following text to approximately {target_words} words 
-while maintaining the exact same topic, argument, and academic tone ({style.upper()} style).
+            "content": f"""You are an academic writer. Write a complete, well-structured academic essay on the following topic.
+
+TOPIC / INSTRUCTIONS:
+{topic}
+
+REQUIREMENTS:
+- Length: approximately {target_words} words ({pages or 3} pages at 275 words/page)
+- Style: {style.upper()}
+- The essay needs approximately {num_sources} citeable factual or empirical claims
+- Structure: introduction, clearly developed body paragraphs, conclusion
+- Tone: formal academic prose
+
+CRITICAL CITATION RULE — read carefully:
+- Do NOT write any citation markers, brackets, or placeholders anywhere in the text
+- Do NOT write things like (Author, Year), [citation needed], (placeholder), or any reference markers
+- Write EVERY factual claim as a clean, confident statement with NO marker attached
+- Example of what to write: "Adolescents who use social media for more than three hours daily show elevated rates of depression."
+- Example of what NOT to write: "Adolescents who use social media for more than three hours daily show elevated rates of depression (Smith, 2021)." or "...depression [citation needed]."
+- Citations will be inserted automatically after real sources are found — your job is only to write the claims cleanly
+
+Return ONLY the essay text. No title, no author line, no references section — just the body paragraphs."""
+        }]
+    )
+    essay = response.content[0].text.strip()
+    # Safety: strip any placeholder patterns the model may have snuck in anyway
+    essay = _strip_placeholders(essay)
+    word_count = len(essay.split())
+    print(f"   ✅ Essay written: {word_count} words (~{word_count // WORDS_PER_PAGE} pages)")
+    return essay
+
+
+def expand_existing_essay(text: str, pages: int, style: str, client: anthropic.Anthropic) -> str:
+    """Expand an existing essay draft to hit a page target.
+    Never writes placeholder citations — any new content is written claim-only."""
+    target_words  = pages * WORDS_PER_PAGE
+    current_words = len(text.split())
+    if current_words >= target_words * 0.9:
+        return text
+
+    print(f"\n📝 Expanding essay to ~{target_words} words ({pages} pages)...")
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8000,
+        messages=[{
+            "role": "user",
+            "content": f"""You are an academic writer. Expand the following essay to approximately {target_words} words.
 
 Rules:
-- Keep all original sentences — only ADD content, never remove or change existing text
-- Add supporting details, explanations, examples, and transitions between ideas
-- Do not invent citations — leave placeholders where more evidence is needed
-- Maintain consistent academic register throughout
+- Keep all original sentences — only ADD content, never remove or reword existing text
+- Add supporting details, explanations, examples, and transitions
+- CRITICAL: Do NOT write any citation markers in new content — no (Author, Year), no [citation needed],
+  no placeholders of any kind. Write all new factual claims as bare statements only.
+  Citations already in the text like (Smith, 2021) must be preserved exactly.
+- Maintain the same academic register throughout
 - Return ONLY the expanded text, no commentary
 
-Current text ({current_words} words):
+Current essay ({current_words} words):
 {text}"""
         }]
     )
     expanded  = response.content[0].text.strip()
+    expanded  = _strip_placeholders(expanded)
     new_count = len(expanded.split())
     print(f"   Expanded: {current_words} → {new_count} words (~{new_count // WORDS_PER_PAGE} pages)")
     return expanded
+
+
+def _strip_placeholders(text: str) -> str:
+    """Remove any placeholder citation patterns the model may have written."""
+    patterns = [
+        r'\(placeholder[^)]*\)',
+        r'\[placeholder[^\]]*\]',
+        r'\(citation needed\)',
+        r'\[citation needed\]',
+        r'\(citation\)',
+        r'\[citation\]',
+        r'\(source needed\)',
+        r'\[source needed\]',
+        r'\(insert citation\)',
+        r'\[insert citation\]',
+        r'\(needs citation\)',
+        r'\[needs citation\]',
+    ]
+    for p in patterns:
+        text = re.sub(p, '', text, flags=re.IGNORECASE)
+    # Clean up any double spaces left behind
+    text = re.sub(r'  +', ' ', text)
+    text = re.sub(r' ([.,;])', r'\1', text)
+    return text.strip()
 
 
 # ══════════════════════════════════════════════
@@ -396,14 +477,19 @@ TEXT:
     return claims
 
 
-def search_crossref(query: str, max_results: int = 5) -> list[dict]:
+def search_crossref(query: str, max_results: int = 8, min_year: int = None) -> list[dict]:
+    """Search CrossRef. Fetches extra results then sorts by recency so recent papers surface first.
+    min_year: if set, filters out anything older. Defaults to (current_year - 5)."""
+    from datetime import datetime
+    cutoff = min_year if min_year else (datetime.now().year - 5)
     try:
         resp = requests.get(
             CROSSREF_API,
             params={
                 "query":  query,
                 "rows":   max_results,
-                "select": "DOI,title,author,published,container-title,volume,issue,page,publisher,type"
+                "select": "DOI,title,author,published,container-title,volume,issue,page,publisher,type",
+                "filter": f"from-pub-date:{cutoff}"   # CrossRef native date filter
             },
             headers=HEADERS,
             timeout=10
@@ -415,6 +501,9 @@ def search_crossref(query: str, max_results: int = 5) -> list[dict]:
             author_list = [f"{a.get('family','')} {a.get('given','')[:1]}".strip() for a in authors[:6]]
             date_parts  = item.get("published", {}).get("date-parts", [[None]])[0]
             year        = date_parts[0] if date_parts else None
+            # Skip items with no year or below cutoff (belt-and-suspenders)
+            if year and year < cutoff:
+                continue
             results.append({
                 "doi":       item.get("DOI", ""),
                 "title":     (item.get("title") or [""])[0],
@@ -428,6 +517,38 @@ def search_crossref(query: str, max_results: int = 5) -> list[dict]:
                 "type":      item.get("type", "journal-article"),
                 "url":       f"https://doi.org/{item['DOI']}" if item.get("DOI") else ""
             })
+        # Sort: newest first
+        results.sort(key=lambda x: x.get("year") or 0, reverse=True)
+
+        # Fallback: if the date filter returned nothing, retry without it
+        if not results:
+            resp2 = requests.get(
+                CROSSREF_API,
+                params={"query": query, "rows": 5,
+                        "select": "DOI,title,author,published,container-title,volume,issue,page,publisher,type"},
+                headers=HEADERS, timeout=10
+            )
+            resp2.raise_for_status()
+            for item in resp2.json().get("message", {}).get("items", []):
+                authors     = item.get("author", [])
+                author_list = [f"{a.get('family','')} {a.get('given','')[:1]}".strip() for a in authors[:6]]
+                date_parts  = item.get("published", {}).get("date-parts", [[None]])[0]
+                year        = date_parts[0] if date_parts else None
+                results.append({
+                    "doi":       item.get("DOI", ""),
+                    "title":     (item.get("title") or [""])[0],
+                    "authors":   author_list,
+                    "year":      year,
+                    "journal":   (item.get("container-title") or [""])[0],
+                    "volume":    item.get("volume"),
+                    "issue":     item.get("issue"),
+                    "pages":     item.get("page"),
+                    "publisher": item.get("publisher", ""),
+                    "type":      item.get("type", "journal-article"),
+                    "url":       f"https://doi.org/{item['DOI']}" if item.get("DOI") else ""
+                })
+            if results:
+                print(f"   ⚠️  No sources from {cutoff}+ found — using best available (oldest: {min(r['year'] or 9999 for r in results)})")
         return results
     except Exception as e:
         print(f"   ⚠️  CrossRef error for '{query}': {e}")
@@ -506,26 +627,206 @@ Rules:
         }
 
 
-def humanize_text(text: str, client: anthropic.Anthropic) -> str:
-    print("\n✍️  Humanizing text...")
+def check_ai_probability(text: str) -> Optional[float]:
+    """Returns the probability (0-100) that the text is AI-generated, or None if the API fails."""
+    try:
+        # We take the first 500 words to avoid payload size limits
+        preview = " ".join(text.split()[:500])
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/roberta-base-openai-detector",
+            json={"inputs": preview, "options": {"wait_for_model": True}},
+            timeout=15
+        )
+        if response.status_code == 200:
+            results = response.json()
+            if isinstance(results, list) and isinstance(results[0], list):
+                for score_dict in results[0]:
+                    if score_dict.get("label") == "Fake":
+                        return score_dict.get("score", 0.0) * 100
+            elif isinstance(results, list) and isinstance(results[0], dict):
+                for score_dict in results:
+                    if score_dict.get("label") == "Fake":
+                        return score_dict.get("score", 0.0) * 100
+    except Exception as e:
+        print(f"   ⚠️  AI Detection API error: {e}")
+    return None
+
+
+def zerogpt_bypass(text: str) -> str:
+    """Inject zero-width spaces into random long words to break AI detection tokenization."""
+    import random
+    zws = '\u200B'
+    words = text.split(' ')
+    bypassed_words = []
+    for word in words:
+        if len(word) > 4 and random.random() < 0.4:
+            idx = len(word) // 2
+            word = word[:idx] + zws + word[idx:]
+        bypassed_words.append(word)
+    return ' '.join(bypassed_words)
+
+
+def aggressive_humanize_pass(text: str, client: anthropic.Anthropic) -> str:
+    """Pass targeting burstiness, perplexity, and AI-predictability."""
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=8000,
         messages=[{
             "role": "user",
-            "content": f"""You are an academic editor. Rewrite this text to:
-- Sound natural and human-written (vary sentence length, avoid robotic phrasing)
-- Maintain formal academic tone
-- Preserve ALL in-text citations EXACTLY as written — do not move, change, or remove them
-- Keep all facts identical; do not add new claims
+            "content": f"""The following academic text still reads too much like AI. We need to introduce burstiness and perplexity.
 
-Return ONLY the rewritten text, no commentary.
+RULES:
+1. Preserve ALL in-text citations exactly — (Author, Year) tags must not change.
+2. Keep all factual content identical.
+3. ENFORCE BURSTINESS: Mix extremely short sentences (3-5 words) with much longer, complex ones. Do not let sentence lengths remain uniform.
+4. INJECT PERPLEXITY: Replace highly predictable word choices with less common, academically valid synonyms.
+5. ADD MINOR IMPERFECTIONS: Introduce occasional slight conversational pivots or slightly less formal phrasing that real students use.
+6. Return ONLY the rewritten text — no commentary.
 
 TEXT:
 {text}"""
         }]
     )
     return response.content[0].text.strip()
+
+
+def humanize_text(text: str, client: anthropic.Anthropic) -> str:
+    """Multi-pass humanization targeting the specific patterns AI detectors flag.
+
+    Pass 1 — Structural disruption: break the AI essay formula
+    Pass 2 — Lexical variation: replace AI-preferred words and phrases
+    Pass 3 — Rhythm and flow: vary sentence length and add natural imperfections
+    """
+    print("\n✍️  Humanizing — Pass 1/3: Breaking AI structure patterns...")
+
+    # ── Pass 1: Structural disruption ────────────────
+    # AI text has a rigid formula: topic sentence → evidence → analysis → transition.
+    # Break this by splitting paragraphs, merging short ones, and adding conversational
+    # asides and qualifications that real writers use.
+    p1 = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8000,
+        messages=[{
+            "role": "user",
+            "content": f"""You are rewriting academic text to evade AI detection. Your goal is to disrupt the predictable AI essay structure.
+
+RULES — follow every one precisely:
+1. Preserve ALL in-text citations exactly — do not move or remove (Author, Year) tags
+2. Keep every factual claim — do not add or remove information
+3. Break the "topic sentence → evidence → analysis → transition" formula:
+   - Split long structured paragraphs into two shorter ones occasionally
+   - Merge a short paragraph into the one before or after it occasionally
+   - Start some paragraphs mid-thought rather than with a clean topic sentence
+   - End some paragraphs abruptly without a tidy conclusion sentence
+4. Remove ALL of these AI-signature transition phrases (replace with nothing or something more direct):
+   "Furthermore", "Moreover", "Additionally", "It is important to note",
+   "It is worth noting", "In conclusion", "In summary", "This highlights",
+   "This underscores", "This demonstrates", "Notably", "Significantly",
+   "It is evident that", "As previously mentioned", "In light of this"
+5. Add occasional hedging that real writers use: "at least in part", "to some degree",
+   "the evidence suggests", "arguably", "it seems", "in many cases"
+6. Return ONLY the rewritten text — no commentary, no labels
+
+TEXT:
+{text}"""
+        }]
+    ).content[0].text.strip()
+
+    print("   ✍️  Humanizing — Pass 2/3: Replacing AI vocabulary...")
+
+    # ── Pass 2: Lexical substitution ─────────────────
+    # Claude has preferred words it reaches for automatically. Replace them with
+    # the more varied, less-polished vocabulary real students use.
+    p2 = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8000,
+        messages=[{
+            "role": "user",
+            "content": f"""You are editing academic text to make it sound like a real student wrote it, not an AI.
+
+RULES:
+1. Preserve ALL in-text citations exactly — (Author, Year) tags must not change
+2. Keep all factual content identical
+3. Replace these overused AI words with more natural alternatives (do not use the same replacement every time — vary them):
+   - "utilize" → use, apply, employ, work with
+   - "leverage" → use, draw on, rely on, take advantage of
+   - "crucial" / "vital" / "paramount" → important, key, central, necessary
+   - "delve" → look at, examine, explore, dig into
+   - "underscore" / "highlight" → show, suggest, point to, make clear
+   - "multifaceted" → complex, varied, multi-layered
+   - "robust" → strong, reliable, solid, substantial
+   - "holistic" → broad, overall, comprehensive, wide-ranging
+   - "facilitate" → help, support, make possible, enable
+   - "demonstrate" → show, indicate, reveal, suggest
+   - "comprehensive" → thorough, detailed, wide-ranging, broad
+   - "implications" → effects, consequences, meaning, what this means
+4. Where a sentence uses passive voice unnecessarily, switch to active
+5. Replace all em-dashes (—) used as clause separators with commas or restructured sentences
+6. Return ONLY the rewritten text — no commentary
+
+TEXT:
+{p1}"""
+        }]
+    ).content[0].text.strip()
+
+    print("   ✍️  Humanizing — Pass 3/3: Varying rhythm and sentence length...")
+
+    # ── Pass 3: Rhythm variation ──────────────────────
+    # AI text has suspiciously even sentence lengths. Real writing mixes very short
+    # punchy sentences with longer ones. Also add minor authentic imperfections.
+    p3 = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8000,
+        messages=[{
+            "role": "user",
+            "content": f"""Final editing pass on this academic text. Your job is sentence rhythm and natural flow.
+
+RULES:
+1. Preserve ALL in-text citations exactly — (Author, Year) tags must not change
+2. Keep all factual content identical
+3. Vary sentence length aggressively:
+   - After 2-3 long sentences, add one very short sentence (under 10 words) that makes a sharp point
+   - Break some long compound sentences into two shorter ones
+   - Occasionally combine two short sentences into one flowing one
+4. Add natural connective tissue that students actually write:
+   - "That said, ..." / "Even so, ..." / "Still, ..." (instead of "However")
+   - "This matters because..." / "The reason is simple:" (instead of "This is significant because")
+   - "Put differently, ..." (instead of "In other words")
+   - "What this means in practice is..." (instead of "Therefore")
+5. Ensure the first sentence of the paper does NOT start with "In recent years", "Over the past",
+   or any other classic AI essay opener — rewrite it if needed
+6. The final paragraph should NOT start with "In conclusion" or "In summary" — remove or rephrase
+7. Return ONLY the final rewritten text — no commentary, no labels
+
+TEXT:
+{p2}"""
+        }]
+    ).content[0].text.strip()
+    current_text = p3
+    max_retries = 3
+
+    print("\n🧐  Step: Verifying AI Detectability...")
+    for attempt in range(max_retries):
+        ai_prob = check_ai_probability(current_text)
+        if ai_prob is None:
+            print("   ⚠️  AI Detection service unavailable. Applying aggressive humanization pass to ensure safety...")
+            current_text = aggressive_humanize_pass(current_text, client)
+            break
+
+        print(f"   📊 AI Probability: {ai_prob:.1f}%")
+
+        if ai_prob <= 20.0:
+            print("   ✅ Text passes humanization threshold!")
+            break
+
+        print(f"   🔄 AI signature too high. Running aggressive humanization pass (Attempt {attempt + 1}/{max_retries})...")
+        current_text = aggressive_humanize_pass(current_text, client)
+
+    print("\n🕵️  Step: Applying Extreme Humanization (Token-Breaker)...")
+    current_text = zerogpt_bypass(current_text)
+
+    print(f"   ✅ Humanization complete.")
+    return current_text
 
 
 # ══════════════════════════════════════════════
@@ -576,19 +877,29 @@ def run_pipeline(input_path: str, settings: dict):
         if key not in settings or settings[key] == INSTRUCTION_DEFAULTS.get(key):
             settings[key] = val
 
-    if not text:
-        print("\n❌  No essay content found in the input. Please provide text to be cited.")
-        print("    If your file only contains instructions, add your essay body below them.")
-        return
-
     print(f"\n{'='*55}")
     print(f"  Academic Writing Assistant  |  Style: {settings['style'].upper()}")
     print(f"{'='*55}")
     print_settings(settings)
-    print(f"\n   Input: {len(text.split())} words of essay content.")
 
-    if settings["pages"]:
-        text = expand_text_to_pages(text, settings["pages"], settings["style"], client)
+    # ── Determine mode: write from scratch OR work with existing essay ──
+    if not text:
+        # No essay body found — only instructions/topic. Write from scratch.
+        print("\n✏️  No essay body found — writing from scratch based on topic/instructions...")
+        topic_context = file_extracted.get("_raw_instructions", raw)
+        text = write_essay_from_scratch(
+            topic=topic_context,
+            pages=settings["pages"] or 3,
+            sources=settings["sources"] or 6,
+            style=settings["style"],
+            client=client
+        )
+    else:
+        print(f"\n   Input: {len(text.split())} words of existing essay content.")
+        # Strip any placeholders that may already be in the submitted essay
+        text = _strip_placeholders(text)
+        if settings["pages"]:
+            text = expand_existing_essay(text, settings["pages"], settings["style"], client)
 
     claims = extract_claims(text, settings["sources"], client)
     if not claims:
@@ -612,7 +923,7 @@ def run_pipeline(input_path: str, settings: dict):
         print(f"\n   [{i}/{len(claims)}] \"{short}\"")
         print(f"   🔎 {query}")
 
-        sources = search_crossref(query, max_results=5)
+        sources = search_crossref(query, max_results=8, min_year=settings.get("min_year"))
         if not sources:
             print("   ❌ No sources found — skipping.")
             continue
@@ -639,6 +950,14 @@ def run_pipeline(input_path: str, settings: dict):
             idx = cited_text.find(claim)
             end = idx + len(claim)
             cited_text = cited_text[:end] + f" {in_text}" + cited_text[end:]
+
+    # Final safety pass — strip any placeholder citations that slipped through
+    cited_text = _strip_placeholders(cited_text)
+    placeholders_found = cited_text.count("placeholder") + cited_text.count("citation needed")
+    if placeholders_found == 0:
+        print("   ✅ No placeholder citations detected.")
+    else:
+        print(f"   ⚠️  {placeholders_found} placeholder(s) still found after stripping — check output.")
 
     final_text = humanize_text(cited_text, client) if settings["humanize"] else cited_text
 
@@ -688,20 +1007,22 @@ def main():
     parser.add_argument("--style",       choices=["apa","mla","chicago"], help="Citation style")
     parser.add_argument("--pages",       type=int,  help="Target page count (~275 words/page)")
     parser.add_argument("--sources",     type=int,  help="Number of sources required")
-    parser.add_argument("--humanize",    action="store_true", default=None, help="Rewrite to sound natural")
+    parser.add_argument("--no-humanize", action="store_false", dest="humanize", default=None, help="Disable rewriting to sound natural")
+    parser.add_argument("--humanize",    action="store_true", dest="humanize", default=None, help="Rewrite to sound natural (enabled by default)")
     parser.add_argument("--title",       type=str,  help="Paper title")
     parser.add_argument("--author",      type=str,  help="Author name")
     parser.add_argument("--institution", type=str,  help="University / institution")
     parser.add_argument("--course",      type=str,  help="Course name and number")
     parser.add_argument("--instructor",  type=str,  help="Instructor name")
     parser.add_argument("--output",      type=str,  help="Output .docx filename (default: output.docx)")
+    parser.add_argument("--min-year",    type=int,  dest="min_year", help="Oldest source year allowed (default: current year - 5)")
 
     args = parser.parse_args()
 
     file_settings = parse_instructions_file(args.instructions) if args.instructions else {}
     cli_overrides = {k: v for k, v in vars(args).items()
                      if k not in ("input", "instructions") and v is not None}
-    if "--humanize" not in sys.argv:
+    if "--humanize" not in sys.argv and "--no-humanize" not in sys.argv:
         cli_overrides.pop("humanize", None)
 
     settings = merge_settings(file_settings, cli_overrides)
