@@ -66,8 +66,9 @@ MIME_MAP   = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
               ".png": "image/png",  ".webp": "image/webp", ".gif": "image/gif"}
 
 
-def load_input(path: str, client: anthropic.Anthropic) -> str:
-    """Load text from a .txt file OR extract text from an image using Claude vision."""
+def load_raw_text(path: str, client: anthropic.Anthropic) -> str:
+    """Load raw text from a .txt file OR transcribe an image with Claude vision.
+    Returns the full raw content — caller then decides what is instructions vs essay."""
     p = Path(path)
     if not p.exists():
         sys.exit(f"❌  Input file not found: {path}")
@@ -75,7 +76,7 @@ def load_input(path: str, client: anthropic.Anthropic) -> str:
     ext = p.suffix.lower()
 
     if ext in IMAGE_EXTS:
-        print(f"🖼️  Image input detected — extracting text with Claude vision...")
+        print(f"🖼️  Image detected — transcribing with Claude vision...")
         mime = MIME_MAP.get(ext, "image/jpeg")
         with open(p, "rb") as f:
             b64 = base64.standard_b64encode(f.read()).decode("utf-8")
@@ -94,16 +95,16 @@ def load_input(path: str, client: anthropic.Anthropic) -> str:
                         "type": "text",
                         "text": (
                             "Transcribe ALL text visible in this image exactly as written. "
-                            "Preserve paragraph breaks. If this is a handwritten document, "
-                            "transcribe it faithfully. Return ONLY the transcribed text, "
-                            "no commentary or explanation."
+                            "Preserve paragraph breaks and any section headers or labels. "
+                            "If this is a handwritten document, transcribe it faithfully. "
+                            "Return ONLY the transcribed text, no commentary."
                         )
                     }
                 ]
             }]
         )
         text = response.content[0].text.strip()
-        print(f"   Extracted {len(text.split())} words from image.")
+        print(f"   Transcribed {len(text.split())} words from image.")
         return text
 
     elif ext == ".txt":
@@ -111,6 +112,90 @@ def load_input(path: str, client: anthropic.Anthropic) -> str:
 
     else:
         sys.exit(f"❌  Unsupported file type: {ext}. Use .txt, .jpg, .jpeg, .png, or .webp")
+
+
+def separate_instructions_from_content(raw: str, client: anthropic.Anthropic) -> tuple[dict, str]:
+    """Use Claude to detect if the raw text mixes instructions with essay content.
+
+    Handles cases like:
+      - Student typed the assignment brief at the top of their essay file
+      - Scanned assignment sheet with both the instructions and a draft
+      - File starts with 'Write 5 pages in APA on...' then the essay body below
+      - Image of a professor's handwritten brief + the student's draft
+
+    Returns: (extracted_settings_dict, clean_essay_text)
+    The caller merges extracted_settings with lower priority than CLI flags.
+    """
+    print("\n🔍 Checking input for embedded instructions...")
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2000,
+        messages=[{
+            "role": "user",
+            "content": f"""You are parsing a document that may contain BOTH writing instructions/requirements AND actual essay/paper content.
+
+Instructions/requirements look like:
+- "Write a 5-page paper on...", "Research the topic of...", "Topic:"
+- "Use APA format", "cite at least 8 sources", "minimum 10 references"
+- "Author: Jane Smith", "Course: ENSC 301", "Student name:"
+- Assignment briefs, rubrics, word count requirements, formatting rules
+- Directives from a professor or assignment sheet
+
+Essay/paper content looks like:
+- Actual paragraphs making arguments or presenting factual information
+- Content that would need academic citations
+- Introduction, body paragraphs, conclusion sections
+
+Analyze this document carefully and return ONLY a JSON object — no markdown:
+{{
+  "has_embedded_instructions": true or false,
+  "essay_text": "<the actual essay/paper content only — empty string if no essay found>",
+  "extracted_settings": {{
+    "style":       "<apa|mla|chicago or null if not mentioned>",
+    "pages":       <integer or null>,
+    "sources":     <integer or null>,
+    "humanize":    <true or false>,
+    "title":       "<paper title or null>",
+    "author":      "<student/author name or null>",
+    "institution": "<university name or null>",
+    "course":      "<course name/number or null>",
+    "instructor":  "<instructor/professor name or null>",
+    "output":      "<output filename.docx or null>"
+  }},
+  "summary": "<one sentence describing what was found>"
+}}
+
+DOCUMENT:
+{raw}"""
+        }]
+    )
+
+    result   = safe_parse_json(response.content[0].text.strip())
+    has_mixed = result.get("has_embedded_instructions", False)
+    essay     = result.get("essay_text", "").strip()
+    extracted = result.get("extracted_settings", {})
+    summary   = result.get("summary", "")
+
+    # Drop None values so merge_settings falls back to defaults/CLI properly
+    extracted = {k: v for k, v in extracted.items() if v is not None}
+
+    if has_mixed:
+        print(f"   ⚠️  Embedded instructions found: {summary}")
+        if not essay:
+            print("   ℹ️  No essay body found — only instructions detected.")
+            print("      The bot will treat the whole document as context and wait for content.")
+            essay = ""
+        else:
+            print(f"   📄 Essay content isolated: {len(essay.split())} words.")
+        if extracted:
+            nice = ", ".join(f"{k}={repr(v)}" for k, v in extracted.items())
+            print(f"   ⚙️  Settings extracted from file: {nice}")
+    else:
+        print("   ✅ No embedded instructions — treating entire input as essay text.")
+        essay = raw
+
+    return extracted, essay
 
 
 # ══════════════════════════════════════════════
@@ -480,13 +565,27 @@ def write_docx(final_text: str, references: list[str], settings: dict):
 def run_pipeline(input_path: str, settings: dict):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+    # ── Step 0: Load and separate instructions from content ──
+    raw = load_raw_text(input_path, client)
+    file_extracted, text = separate_instructions_from_content(raw, client)
+
+    # Merge: defaults < instructions file < embedded file instructions < CLI flags
+    # (file_extracted has LOWER priority than the passed-in settings which already
+    #  merged defaults + instructions file + CLI — so we only fill gaps)
+    for key, val in file_extracted.items():
+        if key not in settings or settings[key] == INSTRUCTION_DEFAULTS.get(key):
+            settings[key] = val
+
+    if not text:
+        print("\n❌  No essay content found in the input. Please provide text to be cited.")
+        print("    If your file only contains instructions, add your essay body below them.")
+        return
+
     print(f"\n{'='*55}")
     print(f"  Academic Writing Assistant  |  Style: {settings['style'].upper()}")
     print(f"{'='*55}")
     print_settings(settings)
-
-    text = load_input(input_path, client)
-    print(f"\n   Input: {len(text.split())} words loaded.")
+    print(f"\n   Input: {len(text.split())} words of essay content.")
 
     if settings["pages"]:
         text = expand_text_to_pages(text, settings["pages"], settings["style"], client)
